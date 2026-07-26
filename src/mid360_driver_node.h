@@ -336,6 +336,7 @@ public:
                  uint16_t imuPort,
                  PointCloudCallback pclCallback,
                  ImuCallback imuCallback);
+    bool isPtpSynced() const { return ptpSynced_.load(); }
     ~Mid360Driver();
 
     Mid360Driver(const Mid360Driver&)            = delete;
@@ -376,12 +377,8 @@ public:
     bool setDetectMode(uint8_t mode, int timeoutMs = 2000);
     bool setPclDataType(uint8_t type, int timeoutMs = 2000);
 
-    // 配置雷达的数据推送目标 (IP + 端口); 同时设置 STATE/PCL/IMU 三个推送地址
-    bool configurePushDest(const std::string& hostIp,
-                           uint16_t pclPort    = kHostPointCloudBase,
-                           uint16_t imuPort    = kHostImuBase,
-                           uint16_t pushPort   = kHostPushBase,
-                           int timeoutMs = 2000);
+    // 设置单个推送目标的 IP+Port (payload: 4B IP + 2B port + 2B reserved)
+    bool writePushDest(uint16_t key, uint16_t port, int timeoutMs = 2000);
 
 private:
     // ── 异步接收协程 (仅 io 线程) ──
@@ -405,6 +402,7 @@ private:
     asio::ip::udp::socket imuSocket_;        // IMU 接收 socket
     PointCloudCallback    pclCallback_;      // 点云数据回调
     ImuCallback           imuCallback_;      // IMU 数据回调
+    std::atomic<bool>     ptpSynced_{false};   // PTP 时间同步锁定后置 true
     std::atomic<bool>     isRunning_{true};  // 协程运行标志 (stop() → false)
 
     // 控制通道目标 (单播发现后已知目标的 IP:Port)
@@ -462,7 +460,7 @@ private:
     bool tryInitDriver(uint16_t pclPort, uint16_t imuPort);  // 创建 Mid360Driver 实例
     bool scanAndBindPorts();            // 端口扫描 (56301~56350, 56401~56450)
     bool testBind(uint16_t port);       // 临时 bind 测试端口是否空闲
-    bool attemptConnectAndStart();      // discover → configurePushDest → setWorkMode
+    bool attemptConnectAndStart();      // discover → writePushDest → setWorkMode
     void startRetryTimer();             // 启动 2 Hz 后台重连定时器
     void onStartupRetry();              // 定时器回调: 重试绑定 + 发现 + 启动
     void startPublishTimers();          // 创建 PCL/IMU 发布定时器 (socket 绑定后立即调用)
@@ -524,6 +522,7 @@ private:
     std::vector<Point>      pclBufferB_;
     std::mutex              imuMutex_;
     std::vector<ImuMessage> imuBufferA_;
+    bool ptpLogged_ = false;                     // PTP 同步日志已输出（避免反复打印）
     std::vector<ImuMessage> imuBufferB_;
 
     // 发布输出缓冲 (复用, 零拷贝 swap 接入 ROS message)

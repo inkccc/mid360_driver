@@ -110,7 +110,7 @@ void Mid360Driver::setRadarTarget(const std::string& ip, uint16_t port) {
 double Mid360Driver::getTimestamp(const DataHeader& header,
                                    const asio::ip::address& sender) {
     double timestampSec = static_cast<double>(header.timestamp) * 1e-9;
-    if (header.timeType != TIMESTAMP_NO_SYNC) return timestampSec;
+    if (header.timeType != TIMESTAMP_NO_SYNC) { ptpSynced_ = true; return timestampSec; }
 
     if (!hasDelta_) {
         auto now = std::chrono::duration<double>(
@@ -310,11 +310,6 @@ void Mid360Driver::parseImu(const uint8_t* buffer, size_t length,
                              const asio::ip::address& sender) {
     DataHeader header;
     std::memcpy(&header, buffer, sizeof(header));
-    // CRC-32 完整性校验 (当雷达启用 CRC 时生效; Mid-360 默认不填)
-    if (length > sizeof(DataHeader) && header.crc32 != 0
-        && crc32Reflect(buffer + sizeof(DataHeader),
-                        length - sizeof(DataHeader)) != header.crc32)
-        return;
     ImuRawData raw;
     std::memcpy(&raw, buffer + sizeof(DataHeader), sizeof(raw));
     if (imuCallback_) imuCallback_({
@@ -565,27 +560,17 @@ bool Mid360Driver::setPclDataType(uint8_t type, int timeoutMs) {
     return writeParams({{KEY_PCL_DATA_TYPE, {type}}}, timeoutMs);
 }
 
-// ── configurePushDest ──
-// 同时设置 STAGE/PCL/IMU 三个推送目标的 IP+Port
-// 每个目标的 payload: 4B IP + 2B port (LE) + 2B reserved = 8 字节
-bool Mid360Driver::configurePushDest(const std::string& hostIp,
-                                     uint16_t pclPort, uint16_t imuPort,
-                                     uint16_t pushPort, int timeoutMs) {
-    std::error_code errorCode;
-    auto v4 = asio::ip::make_address_v4(hostIp, errorCode);
-    if (errorCode) return false;
-    auto ipBytes = v4.to_bytes();
-
-    auto buildConfig = [&](uint16_t port) -> std::vector<uint8_t> {
-        return {ipBytes[0], ipBytes[1], ipBytes[2], ipBytes[3],
-                static_cast<uint8_t>(port & 0xFF),
-                static_cast<uint8_t>((port >> 8) & 0xFF),
-                0, 0};
-    };
-    return writeParams({
-        {KEY_STATE_IPCFG, buildConfig(pushPort)},
-        {KEY_PCL_IPCFG,   buildConfig(pclPort)},
-        {KEY_IMU_IPCFG,   buildConfig(imuPort)}}, timeoutMs);
+// ── writePushDest ──
+// 设置单个推送目标的 IP+Port
+// payload: 4B IP + 2B port (LE) + 2B reserved = 8 字节
+bool Mid360Driver::writePushDest(uint16_t key, uint16_t port, int timeoutMs) {
+    auto ipBytes = hostIp_.to_bytes();
+    std::vector<uint8_t> val = {
+        ipBytes[0], ipBytes[1], ipBytes[2], ipBytes[3],
+        static_cast<uint8_t>(port & 0xFF),
+        static_cast<uint8_t>((port >> 8) & 0xFF),
+        0, 0};
+    return writeParams({{key, val}}, timeoutMs);
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -885,9 +870,9 @@ bool Mid360DriverNode::tryInitDriver(uint16_t pclPort, uint16_t imuPort) {
 
 // ── attemptConnectAndStart ──
 // 启动序列核心 (静默失败, 不输出 WARN):
-//   discover (或直连) → configurePushDest → 参数配置 → queryWorkState
+//   discover (或直连) → writePushDest → 参数配置 → queryWorkState
 // 雷达可能已在采样模式且保留了推送目标 (上一会话遗留),
-// 此时 discovery / configurePushDest 都可能失败, 但数据通道已就绪。
+// 此时 discovery / writePushDest 都可能失败, 但数据通道已就绪。
 // 返回:
 //   true  = 数据通道已建立 (discover 成功 或 queryWorkState 返回采样)
 //   false = 雷达不可达, 由调用方决定重连策略
@@ -915,8 +900,10 @@ bool Mid360DriverNode::attemptConnectAndStart() {
         writeDebugLog("INFO", "DIRECT_CONNECT", "target=" + targetLidarIp_);
     }
 
-    // ── 配置推送目标 / 参数 (非关键, 静默) ──
-    driver_->configurePushDest(hostIp_, pclPort_, imuPort_, kHostPushBase);
+    // ── 配置推送目标 (拆为独立命令, 避免单条失败回滚影响其他) ──
+    driver_->writePushDest(KEY_PCL_IPCFG,  pclPort_);
+    driver_->writePushDest(KEY_IMU_IPCFG,  imuPort_);
+    driver_->writePushDest(KEY_STATE_IPCFG, kHostPushBase);
     driver_->setPclDataType(pclFormat_);
     driver_->setImuEnabled(isImuEnabled_);
     driver_->setDetectMode(detectMode_);
@@ -1011,6 +998,11 @@ void Mid360DriverNode::onGetWorkState(
 //   pclBufferA_ 非空 → insert 追加 (使用 move_iterator 消除拷贝开销)
 void Mid360DriverNode::onPointCloudReceived(std::vector<Point> points) {
     std::lock_guard<std::mutex> lock(pclMutex_);
+    if (driver_ && driver_->isPtpSynced() && !ptpLogged_) {
+        ptpLogged_ = true;
+        RCLCPP_INFO(get_logger(), "PTP 时间同步已锁定");
+        writeDebugLog("INFO", "PTP_SYNC_LOCKED", "time_type=1, PTP time sync locked");
+    }
     size_t incoming = points.size();
     size_t current  = pclBufferA_.size();
     if (current + incoming > kMaxBufferPoints) [[unlikely]] {

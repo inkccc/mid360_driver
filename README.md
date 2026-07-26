@@ -71,3 +71,54 @@ mid360_driver:
 |------|------|------|
 | `~/enable_sampling` | SetBool | true=采样 / false=待机 |
 | `~/get_work_state` | Trigger | 查询当前工作状态 |
+
+
+## ⏰ PTP 时间同步
+
+Mid-360 雷达内置 IEEE 1588v2.0 PTP 从时钟（slave）🎯，当网络中存在 PTP 主时钟时会自动锁定时间同步。
+驱动检测到 `time_type=1`（PTP）的数据后会自动切换为 PTP 时间戳路径。
+
+### 🔍 判断网卡是否支持 PTP
+
+```bash
+ethtool -T enp170s0
+```
+
+| 输出特征 | 结论 |
+|---------|------|
+| 包含 `hardware-transmit/receive` + `PTP Hardware Clock` | 支持硬件 PTP ✅ |
+| 只有 `software-transmit/receive`，无 `PTP Hardware Clock` | 仅支持软件 PTP |
+
+### 🚀 启动 PTP 主时钟
+
+```bash
+# 软件时间戳模式（推荐，兼容性好）
+sudo ptp4l -i enp170s0 -S
+
+# 硬件时间戳模式（需网卡+驱动支持）
+# 本机 igc 驱动有 tx_timestamp bug，硬件模式不可用
+# sudo ptp4l -i enp170s0 -H
+```
+
+建议配置为 systemd 服务开机自启：
+
+```bash
+sudo tee /etc/systemd/system/ptp4l.service << 'EOF'
+[Unit]
+Description=PTP IEEE 1588 Master Clock
+After=network.target
+
+[Service]
+ExecStart=/usr/sbin/ptp4l -i enp170s0 -S
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl enable ptp4l
+sudo systemctl start ptp4l
+```
+
+
+> 💡 **驱动检测到 `time_type=1`（PTP）的数据后会自动切换为 PTP 时间戳路径**
